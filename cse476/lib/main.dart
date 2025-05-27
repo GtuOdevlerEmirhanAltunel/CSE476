@@ -1,628 +1,543 @@
-import 'dart:io';
-import 'dart:typed_data';
+import 'dart:async';
+import 'dart:ui' as ui;
+
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart'; // For rootBundle
-import 'package:image_picker/image_picker.dart';
-import 'package:google_mlkit_barcode_scanning/google_mlkit_barcode_scanning.dart';
-import 'package:flutter/foundation.dart';
-import 'package:tflite_flutter/tflite_flutter.dart' as tfl;
-import 'package:image/image.dart' as img; // For image manipulation
+import 'package:mobile_scanner/mobile_scanner.dart';
+import 'package:permission_handler/permission_handler.dart';
 
 void main() {
-  runApp(const QRApp());
+  WidgetsFlutterBinding.ensureInitialized();
+  runApp(const MyApp());
 }
 
-class QRApp extends StatelessWidget {
-  const QRApp({super.key});
+class MyApp extends StatelessWidget {
+  const MyApp({super.key});
 
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'AI QR Extractor',
+      title: 'Flutter QR Scanner',
       theme: ThemeData(
-        primarySwatch:
-            Colors.deepPurple, // Changed theme color for a fresh look
+        primarySwatch: Colors.cyan,
         visualDensity: VisualDensity.adaptivePlatformDensity,
-        fontFamily: 'GoogleSans', // Ensure you have this font or change it
-        useMaterial3: true, // Using Material 3 for modern UI
-        colorScheme: ColorScheme.fromSeed(seedColor: Colors.deepPurple),
       ),
-      home: const QRHomePage(),
+      home: const QRScannerScreen(),
     );
   }
 }
 
-class QRHomePage extends StatefulWidget {
-  const QRHomePage({super.key});
+class QRScannerScreen extends StatefulWidget {
+  const QRScannerScreen({super.key});
 
   @override
-  _QRHomePageState createState() => _QRHomePageState();
+  State<QRScannerScreen> createState() => _QRScannerScreenState();
 }
 
-// Helper class to store detection results
-class Detection {
-  final Rect boundingBox; // The bounding box of the detected object
-  final String label; // The label of the detected object (e.g., "qr_code")
-  final double confidence; // The confidence score of the detection
+class _QRScannerScreenState extends State<QRScannerScreen>
+    with WidgetsBindingObserver {
+  final MobileScannerController _scannerController = MobileScannerController(
+    // For mobile_scanner v5.x, consider using arguments like:
+    // formats: [BarcodeFormat.qrCode], // To scan only QR codes
+    // autoStart: true, // Default is true
+    // cameraResolution: Size(640, 480), // Optional: to request a specific resolution
+    facing: CameraFacing.back,
+    // initialTorchState: TorchState.off, // Optional: if you want to set initial torch state
+  );
 
-  Detection(this.boundingBox, this.label, this.confidence);
-}
-
-class _QRHomePageState extends State<QRHomePage> {
-  File? _imageFile;
-  List<String> _qrResults = []; // Store multiple QR results
+  StreamSubscription<BarcodeCapture>? _subscription; // Corrected type
+  List<Barcode> _barcodes = [];
+  ui.Size? _previewSize;
+  Size? _widgetSize;
+  bool _isPermissionGranted = false;
+  bool _isCameraInitialized = false;
   bool _isProcessing = false;
-  late final BarcodeScanner _barcodeScanner;
-  tfl.Interpreter? _interpreter; // TFLite interpreter
-
-  // --- TFLite Model Configuration (ADJUST THESE) ---
-  static const String _modelPath =
-      'assets/model.tflite'; // Your TFLite model path
-  // Example: If your model expects 224x224 RGB images
-  static const int _inputTensorWidth = 224;
-  static const int _inputTensorHeight = 224;
-  // --- End TFLite Model Configuration ---
+  ValueNotifier<TorchState> _torchState = ValueNotifier<TorchState>(
+    TorchState.off,
+  );
+  ValueNotifier<CameraFacing> _cameraFacing = ValueNotifier<CameraFacing>(
+    CameraFacing.back,
+  );
 
   @override
   void initState() {
     super.initState();
-    _barcodeScanner = BarcodeScanner(formats: [BarcodeFormat.qrCode]);
-    _loadModel();
+    WidgetsBinding.instance.addObserver(this);
+    _requestCameraPermission();
   }
 
-  Future<void> _loadModel() async {
-    try {
-      // Load the TFLite model from assets
-      _interpreter = await tfl.Interpreter.fromAsset(_modelPath);
-      if (kDebugMode) {
-        print('TFLite model loaded successfully.');
-        // You can print model input/output tensor details here if needed
-        // print('Input tensors: ${_interpreter?.getInputTensors()}');
-        // print('Output tensors: ${_interpreter?.getOutputTensors()}');
-      }
-    } catch (e) {
-      if (kDebugMode) {
-        print('Failed to load TFLite model: $e');
-      }
-      // Handle model loading failure (e.g., show an error message)
+  Future<void> _requestCameraPermission() async {
+    final status = await Permission.camera.request();
+    if (mounted) {
       setState(() {
-        _qrResults = ["Error: Failed to load detection model."];
+        _isPermissionGranted = status == PermissionStatus.granted;
       });
+      if (_isPermissionGranted) {
+        _initializeScanner();
+      } else {
+        _showPermissionDeniedDialog();
+      }
+    }
+  }
+
+  void _showPermissionDeniedDialog() {
+    if (mounted &&
+        context.findRenderObject() != null &&
+        context.findRenderObject()!.attached) {
+      showDialog(
+        context: context,
+        builder: (BuildContext context) {
+          return AlertDialog(
+            title: const Text('Camera Permission Denied'),
+            content: const Text(
+              'This app needs camera access to scan QR codes. Please grant camera permission in app settings.',
+            ),
+            actions: <Widget>[
+              TextButton(
+                child: const Text('Open Settings'),
+                onPressed: () {
+                  openAppSettings();
+                  Navigator.of(context).pop();
+                },
+              ),
+              TextButton(
+                child: const Text('OK'),
+                onPressed: () {
+                  Navigator.of(context).pop();
+                },
+              ),
+            ],
+          );
+        },
+      );
+    }
+  }
+
+  void _initializeScanner() {
+    // Ensure controller is not already started or disposed
+    if (_scannerController.value.isRunning ||
+        _scannerController.value.isInitialized) {
+      // It seems mobile_scanner v5 automatically starts based on its lifecycle with the widget
+      // explicit _scannerController.start() might not be needed or could cause issues if called redundantly.
+      // The controller starts when the MobileScanner widget is built and visible.
+    }
+
+    // Subscribe to barcode stream
+    // The stream type is BarcodeCapture
+    _subscription = _scannerController.barcodes.listen(
+      _handleBarcodeDetection,
+      onError: (error) {
+        print("Error in barcode stream: $error");
+      },
+    );
+
+    // Listen to controller state changes for initialization
+    // This is a common pattern, but for mobile_scanner v5, initialization is tied to the widget.
+    // We can check _scannerController.value.isInitialized.
+    // Let's rely on the MobileScanner widget to handle camera initialization.
+    // We can use a flag or check controller.value.isRunning or controller.value.isInitialized.
+    // For simplicity, we'll assume the MobileScanner widget handles initialization.
+    // If MobileScanner widget is in the tree and visible, camera should start.
+
+    // We can check the controller's value to see if it's running.
+    // This is more of a reactive check.
+    _scannerController.addListener(_onControllerStateChanged);
+
+    if (mounted) {
+      setState(() {
+        _isCameraInitialized =
+            true; // Assume initialization will proceed with widget
+      });
+    }
+  }
+
+  void _onControllerStateChanged() {
+    if (!mounted) return;
+    // You can react to changes in _scannerController.value here if needed
+    // For example, if _scannerController.value.hasError
+    if (_scannerController.value.error != null) {
+      print("MobileScannerController error: ${_scannerController.value.error}");
+      // Potentially show a message to the user
+      if (mounted &&
+          context.findRenderObject() != null &&
+          context.findRenderObject()!.attached) {
+        // ScaffoldMessenger.of(context).showSnackBar(
+        //     SnackBar(content: Text('Camera error: ${_scannerController.value.error}')),
+        // );
+      }
+    }
+    // Update preview size if it changes and is valid
+    if (_scannerController.value.size.width > 0 &&
+        _scannerController.value.size.height > 0) {
+      if (_previewSize != _scannerController.value.size) {
+        setState(() {
+          _previewSize = _scannerController.value.size;
+        });
+      }
+    }
+  }
+
+  void _handleBarcodeDetection(BarcodeCapture capture) {
+    if (!mounted || _isProcessing) return;
+
+    if (capture.barcodes.isNotEmpty) {
+      _isProcessing = true;
+      setState(() {
+        _barcodes = capture.barcodes;
+        // Ensure preview size is captured correctly from the controller's current value
+        if (_scannerController.value.size.width > 0 &&
+            _scannerController.value.size.height > 0) {
+          _previewSize = _scannerController.value.size;
+        }
+      });
+
+      Future.delayed(const Duration(milliseconds: 100), () {
+        if (mounted) {
+          _isProcessing = false;
+        }
+      });
+    } else {
+      if (_barcodes.isNotEmpty) {
+        setState(() {
+          _barcodes = [];
+        });
+      }
     }
   }
 
   @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    super.didChangeAppLifecycleState(state);
+    // The mobile_scanner widget itself handles lifecycle states like pausing and resuming the camera.
+    // Explicitly calling start/stop on the controller based on app lifecycle might
+    // conflict with the widget's own lifecycle management in v5.x.
+    // It's generally recommended to let the widget manage this.
+    // If you need fine-grained control, ensure it doesn't conflict.
+    // For now, we remove explicit start/stop here to rely on the widget.
+
+    // Example: if (state == AppLifecycleState.inactive) { _scannerController.stop(); }
+    // else if (state == AppLifecycleState.resumed) { _scannerController.start(); }
+    // This needs careful testing with mobile_scanner v5.x behavior.
+  }
+
+  @override
   void dispose() {
-    _barcodeScanner.close();
-    _interpreter?.close(); // Close the TFLite interpreter
+    WidgetsBinding.instance.removeObserver(this);
+    _subscription?.cancel();
+    _scannerController.removeListener(_onControllerStateChanged);
+    // Dispose the controller when the widget is disposed.
+    // This is important to release camera resources.
+    _scannerController.dispose();
     super.dispose();
-  }
-
-  Future<void> _pickImageAndProcess() async {
-    final picker = ImagePicker();
-    final pickedFile = await picker.pickImage(source: ImageSource.gallery);
-
-    if (pickedFile != null) {
-      setState(() {
-        _imageFile = File(pickedFile.path);
-        _qrResults = [];
-        _isProcessing = true;
-      });
-      await _detectAndScanQRCodes(_imageFile!);
-    } else {
-      if (kDebugMode) {
-        print('User canceled image picking.');
-      }
-    }
-  }
-
-  // Preprocesses the image to the format expected by the TFLite model
-  Future<Uint8List> _preprocessImage(File imageFile) async {
-    final imageBytes = await imageFile.readAsBytes();
-    img.Image? originalImage = img.decodeImage(imageBytes);
-
-    if (originalImage == null) {
-      throw Exception("Could not decode image");
-    }
-
-    // Resize the image to the model's expected input size
-    img.Image resizedImage = img.copyResize(
-      originalImage,
-      width: _inputTensorWidth,
-      height: _inputTensorHeight,
-    );
-
-    // Convert the image to a byte buffer (quantized models might need Uint8List)
-    // For float models, you'd normalize and convert to Float32List
-    // This is a placeholder. You MUST adjust this based on your model's requirements.
-    // Example for a float model (normalize to [-1, 1] or [0, 1]):
-    // var inputBuffer = Float32List(1 * _inputTensorWidth * _inputTensorHeight * 3);
-    // int pixelIndex = 0;
-    // for (int y = 0; y < _inputTensorHeight; y++) {
-    //   for (int x = 0; x < _inputTensorWidth; x++) {
-    //     var pixel = resizedImage.getPixel(x, y);
-    //     inputBuffer[pixelIndex++] = (img.getRed(pixel) / 255.0 - 0.5) * 2.0;   // R
-    //     inputBuffer[pixelIndex++] = (img.getGreen(pixel) / 255.0 - 0.5) * 2.0; // G
-    //     inputBuffer[pixelIndex++] = (img.getBlue(pixel) / 255.0 - 0.5) * 2.0;  // B
-    //   }
-    // }
-    // return inputBuffer.buffer.asUint8List(); // This is incorrect for Float32List, just showing structure
-
-    // Example for a common Uint8List RGB format (no normalization, just bytes)
-    // This might be suitable if your TFLite model handles normalization internally or is quantized.
-    var inputBuffer = Uint8List(1 * _inputTensorWidth * _inputTensorHeight * 3);
-    int pixelIndex = 0;
-    for (int y = 0; y < _inputTensorHeight; y++) {
-      for (int x = 0; x < _inputTensorWidth; x++) {
-        var pixel = resizedImage.getPixel(x, y);
-        inputBuffer[pixelIndex++] = pixel.r.toInt(); // R
-        inputBuffer[pixelIndex++] = pixel.g.toInt(); // G
-        inputBuffer[pixelIndex++] = pixel.b.toInt(); // B
-      }
-    }
-    return inputBuffer; // This is a flattened RGB byte list
-  }
-
-  // Runs the TFLite model to detect objects (QR codes)
-  Future<List<Detection>> _runObjectDetection(Uint8List imageBytes) async {
-    if (_interpreter == null) {
-      if (kDebugMode) print("Interpreter not initialized.");
-      return [];
-    }
-
-    // Prepare input tensor
-    // The shape [1, height, width, 3] is common for image models
-    // This needs to match your model's input tensor shape!
-    final input = Reshaping(
-      imageBytes,
-    ).reshape([1, _inputTensorHeight, _inputTensorWidth, 3]);
-
-    // --- Prepare Output Tensors (ADJUST THESE) ---
-    // This is highly dependent on your model's output format.
-    // Example: For a model that outputs bounding boxes, classes, and scores.
-    // You need to know the exact shapes and order.
-    // Let's assume:
-    // output 0: bounding boxes (e.g., [1, num_detections, 4]) -> [ymin, xmin, ymax, xmax] normalized
-    // output 1: class IDs (e.g., [1, num_detections])
-    // output 2: scores (e.g., [1, num_detections])
-    // output 3: number of detections (e.g., [1]) - some models provide this
-
-    // Example output structure (you MUST verify and adjust this)
-    // Map<int, Object> outputs = {
-    //   0: List<List<double>>.filled(1, List<double>.filled(10 * 4, 0.0)).reshape([1, 10, 4]), // Bounding boxes (10 detections, 4 coords)
-    //   1: List<List<double>>.filled(1, List<double>.filled(10, 0.0)).reshape([1, 10]),      // Class IDs
-    //   2: List<List<double>>.filled(1, List<double>.filled(10, 0.0)).reshape([1, 10]),      // Scores
-    // };
-    // --- End Output Tensors ---
-
-    // This is a generic output map. You need to define the shapes based on your model.
-    // Let's assume a common SSD Mobilenet output structure for demonstration:
-    // Output tensor 0: Locations (usually normalized: ymin, xmin, ymax, xmax)
-    // Output tensor 1: Classes (index into your labels file)
-    // Output tensor 2: Scores
-    // Output tensor 3: Number of detections
-    // The shapes below are EXAMPLES. Replace with your model's actual output shapes.
-    var outputLocations = Reshaping(
-      List.filled(1 * 10 * 4, 0.0),
-    ).reshape([1, 10, 4]); // Max 10 detections, 4 coordinates
-    var outputClasses = Reshaping(
-      List.filled(1 * 10, 0.0),
-    ).reshape([1, 10]); // Max 10 detections, class index
-    var outputScores = Reshaping(
-      List.filled(1 * 10, 0.0),
-    ).reshape([1, 10]); // Max 10 detections, score
-    var numDetections = Reshaping(
-      List.filled(1, 0.0),
-    ).reshape([1]); // Number of actual detections
-
-    Map<int, Object> outputs = {
-      0: outputLocations,
-      1: outputClasses,
-      2: outputScores,
-      3: numDetections,
-    };
-
-    try {
-      _interpreter!.runForMultipleInputs([input], outputs);
-    } catch (e) {
-      if (kDebugMode) print("Error running TFLite model: $e");
-      return [];
-    }
-
-    // --- Postprocess Model Output (ADJUST THIS) ---
-    final List<Detection> detections = [];
-    final int N =
-        numDetections[0].toInt(); // Get the actual number of detections
-
-    // Assuming your model has a labels file, and "qr_code" is one of the labels.
-    // You'll need to map class indices from outputClasses to actual labels.
-    // For simplicity, let's assume class '0' is 'qr_code'.
-    const String qrCodeLabel =
-        "qr_code"; // Or check outputClasses[0][i] against your label map
-    const double confidenceThreshold =
-        0.5; // Minimum confidence to consider a detection
-
-    for (int i = 0; i < N; i++) {
-      final score = outputScores[0][i];
-      final classId =
-          outputClasses[0][i].toInt(); // Example: map this to a label
-
-      // Replace this with your actual label mapping and filtering logic
-      // For this example, we assume any detection could be a QR code if score is high.
-      // Or, if your model specifically identifies QR codes, check classId.
-      if (score > confidenceThreshold) {
-        // Bounding box coordinates are often normalized [0.0, 1.0]
-        // Format might be [ymin, xmin, ymax, xmax]
-        final ymin = outputLocations[0][i][0];
-        final xmin = outputLocations[0][i][1];
-        final ymax = outputLocations[0][i][2];
-        final xmax = outputLocations[0][i][3];
-
-        // Convert normalized coordinates to absolute pixel coordinates for cropping
-        // This assumes _imageFile is available and its dimensions are known.
-        // For simplicity, we'll create Rect with normalized values first.
-        // Actual cropping will need image dimensions.
-        final rect = Rect.fromLTRB(xmin, ymin, xmax, ymax); // Normalized rect
-
-        // You might need to filter by classId if your model detects multiple object types
-        // e.g., if (labels[classId] == "qr_code")
-        detections.add(Detection(rect, qrCodeLabel, score));
-        if (kDebugMode) {
-          print('Detected: $qrCodeLabel with score $score at $rect');
-        }
-      }
-    }
-    // --- End Postprocess Model Output ---
-    return detections;
-  }
-
-  Future<Uint8List?> _cropImageToBytes(
-    File originalImageFile,
-    Rect normalizedBoundingBox,
-  ) async {
-    final imageBytes = await originalImageFile.readAsBytes();
-    img.Image? originalImage = img.decodeImage(imageBytes);
-
-    if (originalImage == null) return null;
-
-    final int imgWidth = originalImage.width;
-    final int imgHeight = originalImage.height;
-
-    // Convert normalized bounding box to absolute pixel coordinates
-    final int x = (normalizedBoundingBox.left * imgWidth).toInt();
-    final int y = (normalizedBoundingBox.top * imgHeight).toInt();
-    final int w =
-        ((normalizedBoundingBox.right - normalizedBoundingBox.left) * imgWidth)
-            .toInt();
-    final int h =
-        ((normalizedBoundingBox.bottom - normalizedBoundingBox.top) * imgHeight)
-            .toInt();
-
-    // Ensure coordinates are within image bounds
-    final cropX = x.clamp(0, imgWidth - 1);
-    final cropY = y.clamp(0, imgHeight - 1);
-    final cropW = (x + w).clamp(0, imgWidth) - cropX;
-    final cropH = (y + h).clamp(0, imgHeight) - cropY;
-
-    if (cropW <= 0 || cropH <= 0) return null; // Invalid crop region
-
-    img.Image cropped = img.copyCrop(
-      originalImage,
-      x: cropX,
-      y: cropY,
-      width: cropW,
-      height: cropH,
-    );
-
-    // Encode cropped image to PNG bytes (or JPEG)
-    return Uint8List.fromList(img.encodePng(cropped));
-  }
-
-  Future<void> _decodeQRCodeFromCroppedBytes(
-    Uint8List croppedImageBytes,
-    Rect originalNormalizedBox,
-  ) async {
-    final InputImage inputImage = InputImage.fromBytes(
-      bytes: croppedImageBytes,
-      metadata: InputImageMetadata(
-        // These dimensions are for the CROPPED image.
-        // We need to get them from the actual cropped image if possible.
-        // For simplicity, let's try without explicit dimensions if `fromBytes` handles it.
-        // If not, you might need to decode `croppedImageBytes` again to get its new dimensions.
-        size: const Size(
-          0,
-          0,
-        ), // Will be inferred by MLKit if possible for some formats
-        rotation: InputImageRotation.rotation0deg,
-        format:
-            InputImageFormat
-                .nv21, // This might need to be InputImageFormat.bgra8888 or similar depending on how `encodePng` works.
-        // For PNG bytes, ML Kit might handle it. If issues, try decoding PNG to raw pixels.
-        // Let's try a common one, or let ML Kit infer.
-        // Update: ML Kit usually expects uncompressed formats like NV21, YUV_420_888, BGRA8888.
-        // PNG bytes might not work directly.
-        // A more robust way is to convert the cropped img.Image to a format ML Kit likes.
-        // For now, we'll try with PNG bytes and see if ML Kit handles it.
-        // If not, you'll need to convert `img.Image cropped` to raw BGRA8888 bytes.
-        bytesPerRow: croppedImageBytes.length ~/ originalNormalizedBox.height,
-      ),
-    );
-
-    // --- Alternative: Convert cropped img.Image to BGRA8888 for ML Kit ---
-    // This is a more reliable way than passing PNG bytes directly.
-    // img.Image croppedImage = img.decodeImage(croppedImageBytes)!; // If you passed PNG bytes
-    // Uint8List bgraBytes = Uint8List(croppedImage.width * croppedImage.height * 4);
-    // int i = 0;
-    // for (int py = 0; py < croppedImage.height; py++) {
-    //   for (int px = 0; px < croppedImage.width; px++) {
-    //     int pixel = croppedImage.getPixel(px, py);
-    //     bgraBytes[i++] = img.getBlue(pixel);
-    //     bgraBytes[i++] = img.getGreen(pixel);
-    //     bgraBytes[i++] = img.getRed(pixel);
-    //     bgraBytes[i++] = img.getAlpha(pixel);
-    //   }
-    // }
-    // final InputImage inputImageReliable = InputImage.fromBytes(
-    //   bytes: bgraBytes,
-    //   metadata: InputImageMetadata(
-    //     size: Size(croppedImage.width.toDouble(), croppedImage.height.toDouble()),
-    //     rotation: InputImageRotation.rotation0deg,
-    //     format: InputImageFormat.bgra8888, // This is a common format ML Kit supports
-    //     bytesPerRow: croppedImage.width * 4,
-    //   ),
-    // );
-    // --- End Alternative ---
-
-    try {
-      // Use the reliable input image if you implement the alternative above
-      // final List<Barcode> barcodes = await _barcodeScanner.processImage(inputImageReliable);
-      final List<Barcode> barcodes = await _barcodeScanner.processImage(
-        inputImage,
-      );
-
-      if (barcodes.isNotEmpty) {
-        for (final barcode in barcodes) {
-          if (barcode.format == BarcodeFormat.qrCode &&
-              barcode.rawValue != null) {
-            setState(() {
-              _qrResults.add(barcode.rawValue!);
-              if (kDebugMode) print('QR Code Decoded: ${barcode.rawValue}');
-            });
-          }
-        }
-      } else {
-        if (kDebugMode) {
-          print('No QR code found in cropped region: $originalNormalizedBox');
-        }
-      }
-    } catch (e) {
-      if (kDebugMode) {
-        print("Error during QR code decoding from cropped image: $e");
-      }
-      // Optionally add an error message to _qrResults for this specific crop
-    }
-  }
-
-  Future<void> _detectAndScanQRCodes(File imageFile) async {
-    if (_interpreter == null) {
-      setState(() {
-        _qrResults = ["Error: Detection model not loaded."];
-        _isProcessing = false;
-      });
-      return;
-    }
-
-    try {
-      // 1. Preprocess the image for the TFLite model
-      final Uint8List inputBytes = await _preprocessImage(imageFile);
-
-      // 2. Run object detection model
-      final List<Detection> detections = await _runObjectDetection(inputBytes);
-
-      if (detections.isEmpty) {
-        setState(() {
-          _qrResults = ["No QR codes detected by the model."];
-        });
-        if (kDebugMode) print("No objects detected by TFLite model.");
-        return;
-      }
-
-      // 3. For each detected QR code, crop and scan
-      _qrResults.clear(); // Clear previous results
-      for (final detection in detections) {
-        // Assuming detection.label is "qr_code" or similar, or you filter appropriately
-        if (kDebugMode) {
-          print("Processing detected QR at ${detection.boundingBox}");
-        }
-
-        final Uint8List? croppedBytes = await _cropImageToBytes(
-          imageFile,
-          detection.boundingBox,
-        );
-        if (croppedBytes != null) {
-          await _decodeQRCodeFromCroppedBytes(
-            croppedBytes,
-            detection.boundingBox,
-          );
-        } else {
-          if (kDebugMode) {
-            print(
-              "Failed to crop image for detection at ${detection.boundingBox}",
-            );
-          }
-        }
-      }
-
-      if (_qrResults.isEmpty) {
-        setState(() {
-          _qrResults = ["QR codes detected, but none could be read."];
-        });
-      }
-    } catch (e) {
-      setState(() {
-        _qrResults = ["Error processing image: ${e.toString()}"];
-      });
-      if (kDebugMode) {
-        print("Error in _detectAndScanQRCodes: $e");
-      }
-    } finally {
-      setState(() {
-        _isProcessing = false;
-      });
-    }
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('AI QR Code Extractor'),
-        centerTitle: true,
-        backgroundColor: Theme.of(context).colorScheme.primaryContainer,
+        title: const Text('Live QR Code Scanner'),
+        actions: [
+          // Torch toggle
+          ValueListenableBuilder<TorchState>(
+            valueListenable:
+                _torchState, // This is ValueNotifier<TorchState> in v5.x
+            builder: (context, torchState, child) {
+              // torchState is TorchState
+              IconData icon;
+              Color color = Colors.grey;
+              switch (torchState) {
+                case TorchState.off:
+                  icon = Icons.flash_off;
+                  break;
+                case TorchState.on:
+                  icon = Icons.flash_on;
+                  color = Colors.yellow;
+                  break;
+                case TorchState.auto: // Handle the 'auto' case
+                  icon = Icons.flash_auto; // Or another appropriate icon
+                  color = Colors.blue; // Example color for auto
+                  break;
+                case TorchState.unavailable:
+                  icon = Icons.flashlight_off; // Icon for unavailable
+                  color = Colors.red; // Example color for unavailable
+                  break;
+              }
+              return IconButton(
+                icon: Icon(icon, color: color),
+                onPressed: () => _scannerController.toggleTorch(),
+              );
+            },
+          ),
+          // Camera switch
+          ValueListenableBuilder<CameraFacing>(
+            valueListenable:
+                _cameraFacing, // This is ValueNotifier<CameraFacing> in v5.x
+            builder: (context, cameraFacing, child) {
+              // cameraFacing is CameraFacing
+              IconData icon;
+              switch (cameraFacing) {
+                case CameraFacing.front:
+                  icon = Icons.camera_front;
+                  break;
+                case CameraFacing.back:
+                  icon = Icons.camera_rear;
+                  break;
+                // No default needed as CameraFacing has only two states.
+              }
+              return IconButton(
+                icon: Icon(icon),
+                onPressed: () => _scannerController.switchCamera(),
+              );
+            },
+          ),
+        ],
       ),
-      body: Padding(
-        padding: const EdgeInsets.all(16.0),
-        child: SingleChildScrollView(
-          child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: <Widget>[
-              ElevatedButton.icon(
-                icon: const Icon(Icons.image_search),
-                onPressed: _isProcessing ? null : _pickImageAndProcess,
-                label: const Text('Pick Image & Scan QR Codes'),
-                style: ElevatedButton.styleFrom(
-                  padding: const EdgeInsets.symmetric(vertical: 12),
-                  textStyle: const TextStyle(fontSize: 16),
-                  backgroundColor: Theme.of(context).colorScheme.primary,
-                  foregroundColor: Theme.of(context).colorScheme.onPrimary,
+      body: Builder(
+        builder: (context) {
+          if (!_isPermissionGranted) {
+            return const Center(
+              child: Padding(
+                padding: EdgeInsets.all(16.0),
+                child: Text(
+                  'Camera permission not granted. Please grant permission in app settings.',
+                  textAlign: TextAlign.center,
                 ),
               ),
-              const SizedBox(height: 20),
-              if (_isProcessing)
-                const Center(child: CircularProgressIndicator())
-              else ...[
-                if (_imageFile != null)
-                  Column(
-                    children: [
-                      Text(
-                        "Selected Image:",
-                        style: Theme.of(context).textTheme.titleMedium,
-                      ),
-                      const SizedBox(height: 8),
-                      ClipRRect(
-                        // Add rounded corners to the image preview
-                        borderRadius: BorderRadius.circular(12.0),
-                        child: Image.file(
-                          _imageFile!,
-                          height: 250, // Increased height for better preview
-                          fit: BoxFit.contain,
-                          // TODO: Optionally draw bounding boxes from `detections` here
+            );
+          }
+
+          // Check if the controller's value indicates the camera is running and has a valid size
+          // _isCameraInitialized can be true, but controller.value.isRunning or .isInitialized is more direct
+          // For v5, MobileScanner widget handles the camera state.
+          // We show MobileScanner directly. If it fails, it might show an error internally or we rely on controller.value.error.
+
+          return LayoutBuilder(
+            builder: (context, constraints) {
+              _widgetSize = Size(constraints.maxWidth, constraints.maxHeight);
+
+              // Update previewSize from controller if available and different
+              // This is also handled in _onControllerStateChanged
+              if (_scannerController.value.size.width > 0 &&
+                  _scannerController.value.size.height > 0) {
+                if (_previewSize != _scannerController.value.size) {
+                  // Schedule a microtask to avoid calling setState during build
+                  Future.microtask(() {
+                    if (mounted) {
+                      setState(() {
+                        _previewSize = _scannerController.value.size;
+                      });
+                    }
+                  });
+                }
+              } else if (_previewSize == null &&
+                  _widgetSize != null &&
+                  _widgetSize!.width > 0 &&
+                  _widgetSize!.height > 0) {
+                // Fallback if controller size is not yet available, use widget size as a rough estimate for initial paint
+                // This is not ideal for coordinate mapping but prevents painter from crashing
+                // _previewSize = _widgetSize; // This might lead to incorrect scaling initially.
+                // It's better to wait for actual preview size.
+              }
+
+              return Stack(
+                children: [
+                  MobileScanner(
+                    controller: _scannerController,
+                    fit: BoxFit.cover,
+                    // onDetect is an alternative to listening to the barcodes stream
+                    // It's often simpler for basic use cases.
+                    // onDetect: _handleBarcodeDetection, // if you prefer this
+                    errorBuilder: (context, error, child) {
+                      // Handle scanner errors, e.g., camera not available
+                      print("MobileScanner error: $error");
+                      return Center(
+                        child: Padding(
+                          padding: const EdgeInsets.all(16.0),
+                          child: Text(
+                            'Scanner Error: ${error.errorDetails?.message ?? 'Unknown error'}\nPlease ensure camera is available and permissions are granted.',
+                            textAlign: TextAlign.center,
+                            style: const TextStyle(color: Colors.red),
+                          ),
                         ),
-                      ),
-                      const SizedBox(height: 20),
-                    ],
+                      );
+                    },
                   ),
-                if (_qrResults.isNotEmpty)
-                  Card(
-                    // Display results in a card for better UI
-                    elevation: 2,
-                    margin: const EdgeInsets.symmetric(vertical: 10),
-                    child: Padding(
-                      padding: const EdgeInsets.all(16.0),
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(
-                            _qrResults.length == 1 &&
-                                    _qrResults[0].startsWith("Error:")
-                                ? "Status:"
-                                : "QR Code Results:",
-                            style: Theme.of(
-                              context,
-                            ).textTheme.titleMedium?.copyWith(
-                              color:
-                                  _qrResults.length == 1 &&
-                                          _qrResults[0].startsWith("Error:")
-                                      ? Theme.of(context).colorScheme.error
-                                      : Theme.of(context).colorScheme.primary,
-                            ),
-                          ),
-                          const SizedBox(height: 8),
-                          ..._qrResults.map(
-                            (result) => Padding(
-                              padding: const EdgeInsets.symmetric(
-                                vertical: 4.0,
-                              ),
-                              child: Text(
-                                result,
-                                style: TextStyle(
-                                  fontSize: 16,
-                                  fontWeight:
-                                      result.startsWith("Error:")
-                                          ? FontWeight.normal
-                                          : FontWeight.bold,
-                                  color:
-                                      result.startsWith("Error:")
-                                          ? Theme.of(context).colorScheme.error
-                                          : Colors.black87,
-                                ),
-                              ),
-                            ),
-                          ),
-                        ],
+                  if (_barcodes.isNotEmpty &&
+                      _previewSize != null &&
+                      _widgetSize != null &&
+                      _previewSize!.width > 0 &&
+                      _previewSize!.height > 0)
+                    CustomPaint(
+                      painter: QRCodePainter(
+                        barcodes: _barcodes,
+                        imageAnalysisSize: _previewSize!,
+                        widgetSize: _widgetSize!,
+                        // Get current camera facing from controller's value for painter
+                        cameraFacing: _scannerController.facing,
                       ),
+                      size: _widgetSize!,
                     ),
-                  )
-                else if (_imageFile != null &&
-                    !_isProcessing) // If image was processed but no results
-                  Text(
-                    'No QR codes found or could be read.',
-                    textAlign: TextAlign.center,
-                    style: TextStyle(fontSize: 16, color: Colors.grey[600]),
-                  ),
-              ],
-            ],
-          ),
-        ),
+                  // Show a loading indicator or message if preview size is not yet determined
+                  if (_previewSize == null || _previewSize!.isEmpty)
+                    const Center(child: Text("Initializing camera...")),
+                ],
+              );
+            },
+          );
+        },
       ),
     );
   }
 }
 
-// Helper extension for reshaping lists (used for TFLite input/output)
-extension Reshaping on List<dynamic> {
-  List<dynamic> reshape(List<int> shape) {
-    if (shape.isEmpty) return this;
-    final List<dynamic> reshaped = [];
-    final int totalElements = shape.reduce((a, b) => a * b);
-    if (length != totalElements) {
-      throw ArgumentError(
-        'Cannot reshape list of length $length to shape $shape',
-      );
+class QRCodePainter extends CustomPainter {
+  final List<Barcode> barcodes;
+  final ui.Size imageAnalysisSize;
+  final Size widgetSize;
+  final CameraFacing cameraFacing;
+
+  QRCodePainter({
+    required this.barcodes,
+    required this.imageAnalysisSize,
+    required this.widgetSize,
+    required this.cameraFacing,
+  });
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (imageAnalysisSize.isEmpty ||
+        widgetSize.isEmpty ||
+        imageAnalysisSize.width == 0 ||
+        imageAnalysisSize.height == 0)
+      return;
+
+    final double imageAspect =
+        imageAnalysisSize.width / imageAnalysisSize.height;
+    final double widgetAspect = widgetSize.width / widgetSize.height;
+
+    double scaleX, scaleY;
+    double offsetX = 0.0;
+    double offsetY = 0.0;
+
+    if (widgetAspect > imageAspect) {
+      scaleY = widgetSize.height / imageAnalysisSize.height;
+      scaleX = scaleY;
+      offsetX = (widgetSize.width - imageAnalysisSize.width * scaleX) / 2.0;
+    } else {
+      scaleX = widgetSize.width / imageAnalysisSize.width;
+      scaleY = scaleX;
+      offsetY = (widgetSize.height - imageAnalysisSize.height * scaleY) / 2.0;
     }
 
-    // This is a simplified reshape, assuming it's being used correctly
-    // for TFLite where the outer list might be the batch.
-    // For a true multi-dimensional reshape, a more complex logic is needed.
-    // For now, this works if the input is flat and becomes e.g. [1, H, W, C]
-    if (shape.length == 4 && shape[0] == 1) {
-      // Common case: [1, H, W, C]
-      // This is a placeholder. Proper reshaping is complex.
-      // TFLite plugins often handle this if the flat list is correct.
-      // The plugin expects a List<List<List<List<double>>>>> for input [1,H,W,C]
-      // or Uint8List directly if it's a single tensor.
-      // The `tflite_flutter` plugin is flexible.
-      // When you assign to `_interpreter.run(input, output)`,
-      // `input` should be `List<Object>` where each object is a tensor.
-      // If your model has one input tensor of shape [1, H, W, C],
-      // then `input` would be `[tensorDataAsNestedListOrFlatBuffer]`.
-      // The provided `imageBytes.reshape(...)` in `_runObjectDetection`
-      // uses a simple List<dynamic> which might need to be further structured
-      // or directly passed if the plugin supports flat buffers for the given shape.
-      // The `tflite_flutter` plugin is quite good at inferring this.
+    final Paint paint =
+        Paint()
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 3.0
+          ..color = Colors.red.shade700;
+
+    final Paint backgroundPaint =
+        Paint()
+          ..color = Colors.black.withOpacity(0.7)
+          ..style = PaintingStyle.fill;
+
+    for (final barcode in barcodes) {
+      final List<Offset?> corners = barcode.corners;
+      final String displayValue =
+          barcode.displayValue ?? barcode.rawValue ?? 'N/A';
+
+      if (corners.isNotEmpty && corners.length >= 4) {
+        if (corners.any((p) => p == null)) continue;
+        final List<Offset> validCorners = corners.cast<Offset>().toList();
+
+        final List<Offset> scaledCorners =
+            validCorners.map((corner) {
+              double dx = corner.dx * scaleX + offsetX;
+              double dy = corner.dy * scaleY + offsetY;
+
+              // For front camera with BoxFit.cover, if the image from the scanner is mirrored,
+              // and the corners are relative to that mirrored image, this scaling might be sufficient.
+              // If corners are relative to a non-mirrored image but displayed mirrored,
+              // then dx might need to be `widgetSize.width - dx` after scaling.
+              // However, mobile_scanner usually provides corners that work with its display.
+              // Test this part carefully with front camera.
+              // if (cameraFacing == CameraFacing.front) {
+              //   dx = (imageAnalysisSize.width - corner.dx) * scaleX + offsetX; // Example if mirroring needed
+              // }
+
+              return Offset(dx, dy);
+            }).toList();
+
+        final Path path = Path();
+        path.moveTo(scaledCorners[0].dx, scaledCorners[0].dy);
+        for (int i = 1; i < scaledCorners.length; i++) {
+          path.lineTo(scaledCorners[i].dx, scaledCorners[i].dy);
+        }
+        path.close();
+        canvas.drawPath(path, paint);
+
+        final TextSpan span = TextSpan(
+          text: displayValue,
+          style: TextStyle(
+            color: Colors.white,
+            fontSize: 14.0,
+            fontWeight: FontWeight.bold,
+            shadows: [
+              Shadow(
+                blurRadius: 2.0,
+                color: Colors.black.withOpacity(0.7),
+                offset: const Offset(1.0, 1.0),
+              ),
+            ],
+          ),
+        );
+        final TextPainter tp = TextPainter(
+          text: span,
+          textAlign: TextAlign.left,
+          textDirection: TextDirection.ltr,
+        );
+        tp.layout(maxWidth: widgetSize.width - 20);
+
+        double textX = scaledCorners[0].dx;
+        double textY = scaledCorners[0].dy - tp.height - 8;
+
+        if (textY < 5) {
+          textY =
+              (scaledCorners.length > 3
+                  ? scaledCorners[3].dy
+                  : scaledCorners[0].dy) +
+              8;
+        }
+        if (textX + tp.width > widgetSize.width - 5) {
+          textX = widgetSize.width - tp.width - 5;
+        }
+        if (textX < 5) {
+          textX = 5;
+        }
+
+        if (textY + tp.height > widgetSize.height - 5) {
+          textY = widgetSize.height - tp.height - 5;
+        }
+
+        Rect textBackgroundRect = Rect.fromLTWH(
+          textX - 4,
+          textY - 4,
+          tp.width + 8,
+          tp.height + 8,
+        );
+        canvas.drawRRect(
+          RRect.fromRectAndRadius(textBackgroundRect, const Radius.circular(4)),
+          backgroundPaint,
+        );
+
+        tp.paint(canvas, Offset(textX, textY));
+      }
     }
-    return this; // Return as is, assuming tflite_flutter handles it.
-    // Or, you'd implement the actual reshaping logic here.
+  }
+
+  @override
+  bool shouldRepaint(covariant QRCodePainter oldDelegate) {
+    return oldDelegate.barcodes != barcodes ||
+        oldDelegate.imageAnalysisSize != imageAnalysisSize ||
+        oldDelegate.widgetSize != widgetSize ||
+        oldDelegate.cameraFacing != cameraFacing;
   }
 }
