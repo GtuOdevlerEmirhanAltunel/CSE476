@@ -1,11 +1,13 @@
 import 'dart:async';
 import 'dart:ui' as ui;
+import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:mobile_scanner/mobile_scanner.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:url_launcher/url_launcher.dart';
+import 'package:image_picker/image_picker.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -54,6 +56,8 @@ class _QRScannerScreenState extends State<QRScannerScreen>
   ValueNotifier<CameraFacing> _cameraFacing = ValueNotifier<CameraFacing>(
     CameraFacing.back,
   );
+
+  final ImagePicker _imagePicker = ImagePicker();
 
   @override
   void initState() {
@@ -273,8 +277,128 @@ class _QRScannerScreenState extends State<QRScannerScreen>
     }
   }
 
-  @override
-  void dispose() {
+  // Select image from gallery and scan for QR codes
+  Future<void> _selectImageAndScan() async {
+    try {
+      final XFile? image = await _imagePicker.pickImage(
+        source: ImageSource.gallery,
+        maxWidth: 1024,
+        maxHeight: 1024,
+      );
+
+      if (image != null) {
+        await _scanImageForQRCodes(image.path);
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Error selecting image: $e'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
+    }
+  }
+
+  // Scan selected image for QR codes
+  Future<void> _scanImageForQRCodes(String imagePath) async {
+    try {
+      final BarcodeCapture? result = await _scannerController.analyzeImage(
+        imagePath,
+      );
+
+      if (result != null && result.barcodes.isNotEmpty) {
+        _showScannedResultsDialog(result.barcodes);
+      } else {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('No QR codes found in the selected image'),
+              backgroundColor: Colors.orange,
+            ),
+          );
+        }
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Error scanning image: $e'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
+    }
+  }
+
+  // Show dialog with scanned results from image
+  void _showScannedResultsDialog(List<Barcode> barcodes) {
+    showDialog(
+      context: context,
+      builder: (BuildContext context) {
+        return AlertDialog(
+          title: Text(
+            'Found ${barcodes.length} QR Code${barcodes.length > 1 ? 's' : ''}',
+          ),
+          content: Container(
+            width: double.maxFinite,
+            constraints: const BoxConstraints(maxHeight: 300),
+            child: ListView.builder(
+              shrinkWrap: true,
+              itemCount: barcodes.length,
+              itemBuilder: (context, index) {
+                final barcode = barcodes[index];
+                final displayValue =
+                    barcode.displayValue ?? barcode.rawValue ?? 'N/A';
+                final isUrl = _isUrl(displayValue);
+
+                return Card(
+                  margin: const EdgeInsets.symmetric(vertical: 4),
+                  child: ListTile(
+                    leading: Icon(
+                      isUrl ? Icons.link : Icons.text_fields,
+                      color: isUrl ? Colors.blue : Colors.grey,
+                    ),
+                    title: Text(
+                      displayValue,
+                      style: TextStyle(
+                        fontSize: 14,
+                        decoration:
+                            isUrl
+                                ? TextDecoration.underline
+                                : TextDecoration.none,
+                      ),
+                    ),
+                    subtitle: Text(
+                      isUrl
+                          ? 'URL - Tap to open or copy'
+                          : 'Text - Tap to copy',
+                      style: const TextStyle(fontSize: 12),
+                    ),
+                    onTap: () {
+                      Navigator.of(context).pop();
+                      if (isUrl) {
+                        _showUrlActionDialog(displayValue);
+                      } else {
+                        _copyToClipboard(displayValue);
+                      }
+                    },
+                  ),
+                );
+              },
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('Close'),
+            ),
+          ],
+        );
+      },
+    );
+
     WidgetsBinding.instance.removeObserver(this);
     _subscription?.cancel();
     _scannerController.removeListener(_onControllerStateChanged);
@@ -406,6 +530,11 @@ class _QRScannerScreenState extends State<QRScannerScreen>
             },
           );
         },
+      ),
+      floatingActionButton: FloatingActionButton(
+        onPressed: _selectImageAndScan,
+        tooltip: 'Select QR Code from Gallery',
+        child: const Icon(Icons.photo_library),
       ),
     );
   }
